@@ -1,0 +1,90 @@
+# -------------------------
+# Python Cache & Bytecode
+# -------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# -------------------------
+# Virtual Environments
+# -------------------------
+.venv/
+venv/
+env/
+backup_env/
+*/.venv/
+*/venv/
+
+# -------------------------
+# Data files (CSV)
+# -------------------------
+*.csv
+
+# -------------------------
+# Build, Distribution, Packaging
+# -------------------------
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# -------------------------
+# Logs & temp files
+# -------------------------
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.DS_Store
+
+# -------------------------
+# Jupyter Notebooks
+# -------------------------
+.ipynb_checkpoints/
+
+# -------------------------
+# VSCode & IDEs
+# -------------------------
+.vscode/
+.idea/
+*.code-workspace
+
+# -------------------------
+# Testing & Coverage
+# -------------------------
+.coverage
+htmlcov/
+.cache/
+.tox/
+.pytest_cache/
+
+# -------------------------
+# Environments / dotenv
+# -------------------------
+.env
+.env.*
+*.env
+
+# -------------------------
+# Misc
+# -------------------------
+*.pkl
+*.pickle
+*.h5
+*.onnx
+*.pth
+*.pt
+*.zip
+*.tar
+*.tar.gz
