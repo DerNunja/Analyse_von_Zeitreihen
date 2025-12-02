@@ -1,266 +1,25 @@
-import io
-from pathlib import Path
-from typing import List
-
-import numpy as np
 import pandas as pd
 import streamlit as st
-from sklearn.cluster import DBSCAN
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-from sklearn.manifold import TSNE
 import plotly.express as px
+import numpy as np
 
-# UMAP optional
 try:
-    import umap  # Paket: umap-learn
+    import umap  # type: ignore
+    HAS_UMAP = True
 except ImportError:
-    umap = None
+    HAS_UMAP = False
+
+from utils import (
+    load_run_with_derivatives,
+    build_segment_meta,
+    get_default_feature_sets,
+    prepare_label_data_for_plots,
+    compute_embedding,
+    compute_k_distance_curve,   
+    dbscan_eps_sweep,           
+)
 
 
-# --------------------- Helper-Funktionen --------------------- #
-
-def _ensure_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    """
-    Castet ausgewählte Spalten robust nach float:
-    - String -> strip -> Komma durch Punkt ersetzen -> to_numeric
-    """
-    df = df.copy()
-    for c in cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(
-                df[c].astype(str).str.strip().str.replace(",", ".", regex=False),
-                errors="coerce",
-            )
-    return df
-
-
-def build_segment_meta(df: pd.DataFrame, label_column: str, seg_col: str = "SegmentID") -> pd.DataFrame:
-    """
-    Baut eine Metatabelle pro SegmentID:
-      - segment_id
-      - label
-      - t_start
-      - t_end
-
-    Erwartet:
-      - 'timestamp' (numerisch)
-      - seg_col (z. B. 'SegmentID') mit int / float IDs
-    """
-    if "timestamp" not in df.columns or seg_col not in df.columns or label_column not in df.columns:
-        return pd.DataFrame(columns=["segment_id", "label", "t_start", "t_end"])
-
-    tmp = df.dropna(subset=[seg_col]).copy()
-    if tmp.empty:
-        return pd.DataFrame(columns=["segment_id", "label", "t_start", "t_end"])
-
-    tmp[seg_col] = tmp[seg_col].astype(int)
-
-    meta = (
-        tmp.groupby(seg_col)
-        .agg(
-            label=(label_column, "first"),
-            t_start=("timestamp", "min"),
-            t_end=("timestamp", "max"),
-        )
-        .reset_index()
-        .rename(columns={seg_col: "segment_id"})
-    )
-    return meta
-
-
-def add_derivative_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Fügt aus timestamp, car0_velocity und wheel_position die abgeleiteten Features:
-        - vel_acc, vel_jerk
-        - steer_vel, steer_jerk
-    hinzu, sofern die entsprechenden Spalten existieren.
-    """
-    df = df.copy()
-    required_cols = ["timestamp", "car0_velocity", "wheel_position"]
-
-    if not all(col in df.columns for col in required_cols):
-        return df
-
-    # numerische Casts
-    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
-    df["car0_velocity"] = pd.to_numeric(
-        df["car0_velocity"].astype(str).str.strip().str.replace(",", ".", regex=False),
-        errors="coerce",
-    )
-    df["wheel_position"] = pd.to_numeric(
-        df["wheel_position"].astype(str).str.strip().str.replace(",", ".", regex=False),
-        errors="coerce",
-    )
-
-    df = df.sort_values("timestamp")
-    dt = df["timestamp"].diff().replace(0, np.nan)
-
-    df["vel_acc"] = df["car0_velocity"].diff() / dt
-    df["vel_jerk"] = df["vel_acc"].diff() / dt
-
-    df["steer_vel"] = df["wheel_position"].diff() / dt
-    df["steer_jerk"] = df["steer_vel"].diff() / dt
-
-    df[["vel_acc", "vel_jerk", "steer_vel", "steer_jerk"]] = (
-        df[["vel_acc", "vel_jerk", "steer_vel", "steer_jerk"]].fillna(0.0)
-    )
-
-    return df
-
-
-def load_run_with_derivatives(
-    uploaded_file,
-    driver_name: str,
-    label_column: str = "Label",
-) -> pd.DataFrame:
-    """
-    Liest eine hochgeladene CSV, fügt Ableitungen hinzu und setzt eine driver-Spalte.
-    """
-    df = pd.read_csv(uploaded_file, low_memory=False)
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
-        df = add_derivative_features(df)
-    df["driver"] = driver_name
-    return df
-
-
-def prepare_label_data_for_plots(
-    df1: pd.DataFrame,
-    df2: pd.DataFrame,
-    label: str,
-    feature_cols: List[str],
-    label_column: str,
-    driver_a_name: str,
-    driver_b_name: str,
-    eps: float,
-    min_samples: int,
-) -> pd.DataFrame:
-    """
-    Schneidet beide DataFrames auf das gewünschte Label zu, trimmt auf gleiche Länge,
-    konvertiert Features zu numerischen Werten, berechnet relative Zeitachsen und
-    führt DBSCAN auf den kombinierten Daten aus.
-    Gibt ein kombiniertes DataFrame zurück:
-      - driver
-      - cluster
-      - t_rel
-      - alle feature_cols
-    """
-
-    seg1 = df1[df1[label_column] == label].copy()
-    seg2 = df2[df2[label_column] == label].copy()
-
-    if len(seg1) == 0 or len(seg2) == 0:
-        raise ValueError(f"Keine Daten für Label '{label}' in einer der Fahrten.")
-
-    seg1["driver"] = driver_a_name
-    seg2["driver"] = driver_b_name
-
-    seg1 = _ensure_numeric(seg1, feature_cols + ["timestamp"])
-    seg2 = _ensure_numeric(seg2, feature_cols + ["timestamp"])
-
-    min_len = min(len(seg1), len(seg2))
-    seg1 = seg1.iloc[:min_len].reset_index(drop=True)
-    seg2 = seg2.iloc[:min_len].reset_index(drop=True)
-
-    # relative Zeit
-    if "timestamp" in seg1.columns:
-        seg1["t_rel"] = seg1["timestamp"] - seg1["timestamp"].iloc[0]
-    else:
-        seg1["t_rel"] = np.arange(len(seg1))
-
-    if "timestamp" in seg2.columns:
-        seg2["t_rel"] = seg2["timestamp"] - seg2["timestamp"].iloc[0]
-    else:
-        seg2["t_rel"] = np.arange(len(seg2))
-
-    combined = pd.concat([seg1, seg2], ignore_index=True)
-
-    # DBSCAN
-    X = combined[feature_cols].fillna(0.0).to_numpy()
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    db = DBSCAN(eps=eps, min_samples=min_samples)
-    combined["cluster"] = db.fit_predict(X_scaled)
-
-    return combined
-
-
-def get_default_feature_sets(df_good: pd.DataFrame, df_bad: pd.DataFrame):
-    """
-    Liefert drei sinnvolle Featurelisten:
-      - cluster_features
-      - time_series_features
-      - dist_features
-    gefiltert auf existierende Spalten.
-    """
-    default_cluster = [
-        "throttle",
-        "brakes",
-        "wheel_position",
-        "car0_velocity",
-        "car0_engine_rpm",
-        "vel_acc",
-        "vel_jerk",
-        "steer_vel",
-        "steer_jerk",
-    ]
-    default_ts = ["car0_velocity", "wheel_position", "throttle", "brakes"]
-    default_dist = ["vel_jerk", "steer_jerk"]
-
-    cluster_features = [
-        c for c in default_cluster if c in df_good.columns and c in df_bad.columns
-    ]
-    time_series_features = [
-        c for c in default_ts if c in df_good.columns and c in df_bad.columns
-    ]
-    dist_features = [
-        c for c in default_dist if c in df_good.columns and c in df_bad.columns
-    ]
-    return cluster_features, time_series_features, dist_features
-
-
-def compute_embedding(
-    X: np.ndarray,
-    method: str,
-    tsne_perplexity: float = 30.0,
-    umap_n_neighbors: int = 15,
-    umap_min_dist: float = 0.1,
-    random_state: int = 42,
-) -> np.ndarray:
-    """
-    Berechnet ein 2D-Embedding mit PCA, t-SNE oder UMAP.
-    """
-    if method == "PCA":
-        pca = PCA(n_components=2, random_state=random_state)
-        return pca.fit_transform(X)
-
-    if method == "t-SNE":
-        tsne = TSNE(
-            n_components=2,
-            perplexity=tsne_perplexity,
-            learning_rate="auto",
-            init="pca",
-            random_state=random_state,
-        )
-        return tsne.fit_transform(X)
-
-    if method == "UMAP":
-        if umap is None:
-            raise RuntimeError("UMAP ist nicht installiert (Paket `umap-learn`).")
-        reducer = umap.UMAP(
-            n_components=2,
-            n_neighbors=umap_n_neighbors,
-            min_dist=umap_min_dist,
-            random_state=random_state,
-        )
-        return reducer.fit_transform(X)
-
-    raise ValueError(f"Unbekannte Methode: {method}")
-
-
-# --------------------- Streamlit UI --------------------- #
 
 st.set_page_config(page_title="Fahrtenvergleich – Zeitreihen & Cluster", layout="wide")
 
@@ -303,7 +62,7 @@ with st.sidebar:
     if dimred_method == "t-SNE":
         tsne_perplexity = st.slider("t-SNE Perplexity", 5.0, 50.0, 30.0, 1.0)
     elif dimred_method == "UMAP":
-        if umap is None:
+        if not HAS_UMAP:
             st.warning("UMAP ist nicht installiert (Paket `umap-learn`). Bitte installieren und App neu starten.")
         umap_n_neighbors = st.slider("UMAP n_neighbors", 5, 100, 15, 1)
         umap_min_dist = st.slider("UMAP min_dist", 0.0, 0.99, 0.1, 0.01)
@@ -314,8 +73,8 @@ if uploaded_a is None or uploaded_b is None:
     st.stop()
 
 # Daten laden
-df_good = load_run_with_derivatives(uploaded_a, driver_name=driver_a_name, label_column=label_column)
-df_bad = load_run_with_derivatives(uploaded_b, driver_name=driver_b_name, label_column=label_column)
+df_good = load_run_with_derivatives(uploaded_a, driver_a_name, label_column=label_column)
+df_bad = load_run_with_derivatives(uploaded_b, driver_b_name, label_column=label_column)
 
 meta_good = build_segment_meta(df_good, label_column=label_column, seg_col="SegmentID")
 meta_bad  = build_segment_meta(df_bad,  label_column=label_column, seg_col="SegmentID")
@@ -506,39 +265,126 @@ with tab_pca:
     df_plot["emb2"] = X_emb[:, 1]
     df_plot["cluster_str"] = df_plot["cluster"].astype(str)
 
+    # Farbe = Fahrer (A = grün, B = rot), Symbol = Cluster-ID
     fig_pca = px.scatter(
         df_plot,
         x="emb1",
         y="emb2",
-        color="cluster_str",
-        symbol="driver",
+        color="driver",
+        symbol="cluster_str",
+        color_discrete_map={
+            driver_a_name: "green",
+            driver_b_name: "red",
+        },
         title=f"{dimred_method}-Embedding für Label '{label_to_plot}'",
-        hover_data=["driver"] + cluster_features,
+        hover_data=["driver", "cluster_str"] + cluster_features,
     )
 
-    # Aufgeräumte Legende: nur noch Cluster (0,1,2,...) – Fahrer über Symbol
-    seen_clusters = set()
-    for tr in fig_pca.data:
-        # Default-Name ist z.B. "-1,good" bzw. "0,bad" -> nur Cluster-Teil nehmen
-        raw_name = tr.name  # z.B. "-1,good"
-        cluster_part = raw_name.split(",")[0]
-        if cluster_part in seen_clusters:
-            tr.showlegend = False
-        else:
-            tr.name = f"Cluster {cluster_part}"
-            seen_clusters.add(cluster_part)
-
-    # Plot etwas „größer“ machen und Marker besser sichtbar
-    fig_pca.update_traces(marker=dict(size=8, line=dict(width=0.5, color="black")))
+    fig_pca.update_traces(
+        marker=dict(
+            size=8,
+            line=dict(width=0.5, color="black"),
+        )
+    )
     fig_pca.update_layout(
         xaxis_title="Komponente 1",
         yaxis_title="Komponente 2",
-        legend_title_text="Cluster",
-        height=800,   # mehr Höhe
+        legend_title_text="Fahrer / Cluster",
+        height=800,
         margin=dict(l=40, r=40, t=60, b=40),
     )
 
+    st.caption(
+        f"Farbe = Fahrer (grün = {driver_a_name}, rot = {driver_b_name}), "
+        "Symbol = Cluster-ID."
+    )
+
     st.plotly_chart(fig_pca, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("### DBSCAN-Tuning (Elbow-Heuristik)")
+
+    st.markdown(
+    """
+    **Ziel:** sinnvolle Wahl von `eps` und `min_samples` für DBSCAN.
+
+    - **k-Distanz-Plot** (links):  
+    sortierte Distanz zum k-ten Nachbarn.  
+    Ein „Knick“ (Elbow) in der Kurve ist ein guter Kandidat für `eps`.
+    - **Cluster vs. eps** (rechts):  
+    zeigt, wie sich die Anzahl Cluster (und Noise) bei variierendem `eps` verhält.
+    """
+    )
+
+    # --- Parameter für Tuning (lokal, unabhängig von den Slidern oben verwendbar) ---
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        k_for_kdist = st.slider(
+            "k für k-Distanz-Plot (typisch = min_samples)",
+            min_value=2,
+            max_value=max(3, min(50, combined.shape[0])),
+            value=min_samples,
+            step=1,
+            key="k_for_kdist",
+        )
+
+    with col_right:
+        eps_min, eps_max = st.slider(
+            "eps-Range für Sweep",
+            min_value=0.1,
+            max_value=3.0,
+            value=(max(0.1, eps - 0.5), min(3.0, eps + 0.5)),
+            step=0.1,
+            key="eps_sweep_range",
+        )
+
+    # --- Datenbasis für Tuning (ohne erneuten DBSCAN) ---
+    X_tune = combined[cluster_features].fillna(0.0).to_numpy()
+
+    # k-Distanz-Plot
+    with col_left:
+        k_dist = compute_k_distance_curve(X_tune, k=k_for_kdist)
+        if k_dist.size == 0:
+            st.info("Zu wenige Punkte für k-Distanz-Plot.")
+        else:
+            idx = np.arange(len(k_dist))
+            fig_k = px.line(
+                x=k_dist,
+                y=idx,
+                labels={"x": "Punkte (sortiert)", "y": f"{k_for_kdist}-Distanz"},
+                title="k-Distanz-Plot",
+            )
+            fig_k.update_layout(margin=dict(l=40, r=20, t=40, b=40))
+            st.plotly_chart(fig_k, use_container_width=True)
+
+    # eps-Sweep-„Elbow“-Plot
+    with col_right:
+      
+
+        eps_values = np.linspace(eps_min, eps_max, num=20)
+        df_sweep = dbscan_eps_sweep(X_tune, eps_values, min_samples=min_samples)
+
+        if df_sweep.empty:
+            st.info("Keine Daten für eps-Sweep verfügbar.")
+        else:
+            fig_eps = px.line(
+                df_sweep,
+                x="eps",
+                y="n_clusters",
+                markers=True,
+                labels={"eps": "eps", "n_clusters": "Anzahl Cluster"},
+                title="Cluster-Anzahl vs. eps",
+            )
+            fig_eps.update_layout(margin=dict(l=40, r=20, t=40, b=40))
+            st.plotly_chart(fig_eps, use_container_width=True)
+
+            # optional: zweite Info-Tabelle
+            with st.expander("Details zum eps-Sweep (inkl. Noise-Anteil)"):
+                st.dataframe(
+                    df_sweep[["eps", "n_clusters", "n_noise", "noise_ratio"]]
+                    .style.format({"noise_ratio": "{:.2%}"})
+                )
 
 
 with tab_dist:
@@ -606,7 +452,6 @@ with tab_dist:
 
         st.markdown(f"##### {nice_title}")
 
-        # Optional: kurze Interpretation für die zwei wichtigsten
         if feat == "vel_jerk":
             st.caption(
                 "Interpretation: Höhere |vel_jerk|-Werte → ruppigeres Gasgeben/Bremsen. "
@@ -631,4 +476,3 @@ with tab_dist:
         st.plotly_chart(fig_violin, use_container_width=True)
 
 st.success("Analyse abgeschlossen. Passe oben die Slider & Feature-Auswahl an, um Effekte zu sehen.")
-
