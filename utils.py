@@ -320,3 +320,204 @@ def dbscan_eps_sweep(
         )
 
     return pd.DataFrame(rows)
+
+def _robust_stats_1d(x: np.ndarray) -> dict:
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return dict(iqr=np.nan, mad=np.nan, abs_med=np.nan, std=np.nan)
+
+    q1 = np.percentile(x, 25)
+    q3 = np.percentile(x, 75)
+    med = np.median(x)
+    iqr = q3 - q1
+
+    mad = np.median(np.abs(x - med))
+    abs_med = np.median(np.abs(x))
+    std = float(np.std(x))
+
+    return dict(iqr=float(iqr), mad=float(mad), abs_med=float(abs_med), std=float(std))
+
+
+def _embedding_spread_2d(emb: np.ndarray) -> dict:
+    """
+    Spread-Maße für 2D-Embedding (robust-ish).
+    """
+    if emb is None or len(emb) == 0:
+        return dict(area=np.nan, trace=np.nan, med_r=np.nan, iqr_r=np.nan)
+
+    emb = emb[np.all(np.isfinite(emb), axis=1)]
+    if emb.shape[0] < 3:
+        return dict(area=np.nan, trace=np.nan, med_r=np.nan, iqr_r=np.nan)
+
+    center = np.median(emb, axis=0)
+    r = np.sqrt(((emb - center) ** 2).sum(axis=1))
+
+    q1 = np.percentile(r, 25)
+    q3 = np.percentile(r, 75)
+
+    cov = np.cov(emb.T)
+    trace = float(np.trace(cov))
+    det = float(np.linalg.det(cov))
+    area = float(np.sqrt(det)) if det > 0 else 0.0
+
+    return dict(area=area, trace=trace, med_r=float(np.median(r)), iqr_r=float(q3 - q1))
+
+
+def compute_driver_quality_scores(
+    df1: pd.DataFrame,
+    df2: pd.DataFrame,
+    label: str,
+    label_column: str,
+    driver_a_name: str,
+    driver_b_name: str,
+    feature_cols: List[str],
+    dimred_method: str = "PCA",
+    tsne_perplexity: float = 30.0,
+    umap_n_neighbors: int = 15,
+    umap_min_dist: float = 0.1,
+    random_state: int = 42,
+    weights: dict | None = None,
+) -> dict:
+    """
+    Liefert einen Score-Vergleich "wer ist schlechter" für ein Label basierend auf:
+      - Feature-Streuung (IQR/MAD/abs_med)
+      - Embedding-Streuung (area/trace/med_r/iqr_r)
+
+    Score-Interpretation:
+      score_driver = gewichtete Summe( normierte Streu-Kennzahlen )
+      schlechter = höherer Score
+
+    Returns:
+      {
+        "label": ...,
+        "scores": {driver_a: ..., driver_b: ...},
+        "winner_worse": "...",
+        "details": {...}
+      }
+    """
+    if weights is None:
+        # Default: Violin/Feature-Streuung wichtiger als Embedding
+        weights = {
+            "feat_iqr": 1.0,
+            "feat_mad": 0.7,
+            "feat_abs_med": 0.7,
+            "emb_area": 0.5,
+            "emb_med_r": 0.5,
+        }
+
+    # Segmente je Fahrer für dieses Label
+    a = df1[df1[label_column] == label].copy()
+    b = df2[df2[label_column] == label].copy()
+    if a.empty or b.empty:
+        raise ValueError(f"Keine Daten für Label '{label}' in einer der Fahrten.")
+
+    a["driver"] = driver_a_name
+    b["driver"] = driver_b_name
+
+    # numeric cast (robust)
+    a = _ensure_numeric(a, feature_cols)
+    b = _ensure_numeric(b, feature_cols)
+
+    # gleiche Länge für fairen Vergleich
+    n = min(len(a), len(b))
+    a = a.iloc[:n].reset_index(drop=True)
+    b = b.iloc[:n].reset_index(drop=True)
+
+    # ---------- Feature-Streuung ----------
+    feat_stats = {}
+    for drv, seg in [(driver_a_name, a), (driver_b_name, b)]:
+        per_feat = {}
+        agg_iqr = []
+        agg_mad = []
+        agg_abs = []
+        for c in feature_cols:
+            x = seg[c].to_numpy(dtype=float)
+            s = _robust_stats_1d(x)
+            per_feat[c] = s
+            if np.isfinite(s["iqr"]): agg_iqr.append(s["iqr"])
+            if np.isfinite(s["mad"]): agg_mad.append(s["mad"])
+            if np.isfinite(s["abs_med"]): agg_abs.append(s["abs_med"])
+        feat_stats[drv] = {
+            "per_feature": per_feat,
+            "mean_iqr": float(np.mean(agg_iqr)) if agg_iqr else np.nan,
+            "mean_mad": float(np.mean(agg_mad)) if agg_mad else np.nan,
+            "mean_abs_med": float(np.mean(agg_abs)) if agg_abs else np.nan,
+        }
+
+    # ---------- Embedding-Streuung ----------
+    # Embedding auf kombinierten Daten rechnen, dann pro driver splitten
+    combined = pd.concat([a, b], ignore_index=True)
+    X = combined[feature_cols].fillna(0.0).to_numpy()
+
+    # standardisieren vor Embedding ist wichtig
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+
+    emb = compute_embedding(
+        Xs,
+        method=dimred_method,
+        tsne_perplexity=tsne_perplexity,
+        umap_n_neighbors=umap_n_neighbors,
+        umap_min_dist=umap_min_dist,
+        random_state=random_state,
+    )
+
+    emb_a = emb[: len(a)]
+    emb_b = emb[len(a) :]
+
+    emb_stats = {
+        driver_a_name: _embedding_spread_2d(emb_a),
+        driver_b_name: _embedding_spread_2d(emb_b),
+    }
+
+    # ---------- Normierung & Score ----------
+    # Wir normieren jede Kennzahl auf [0..1] über beide Fahrer (min-max), robust genug für 2 Werte.
+    def _minmax(v_a, v_b):
+        if not (np.isfinite(v_a) and np.isfinite(v_b)):
+            return (np.nan, np.nan)
+        lo = min(v_a, v_b)
+        hi = max(v_a, v_b)
+        if hi - lo < 1e-12:
+            return (0.5, 0.5)
+        return ((v_a - lo) / (hi - lo), (v_b - lo) / (hi - lo))
+
+    a_iqr, b_iqr = _minmax(feat_stats[driver_a_name]["mean_iqr"], feat_stats[driver_b_name]["mean_iqr"])
+    a_mad, b_mad = _minmax(feat_stats[driver_a_name]["mean_mad"], feat_stats[driver_b_name]["mean_mad"])
+    a_abs, b_abs = _minmax(feat_stats[driver_a_name]["mean_abs_med"], feat_stats[driver_b_name]["mean_abs_med"])
+    a_area, b_area = _minmax(emb_stats[driver_a_name]["area"], emb_stats[driver_b_name]["area"])
+    a_mr, b_mr = _minmax(emb_stats[driver_a_name]["med_r"], emb_stats[driver_b_name]["med_r"])
+
+    score_a = (
+        weights["feat_iqr"] * (a_iqr if np.isfinite(a_iqr) else 0.0)
+        + weights["feat_mad"] * (a_mad if np.isfinite(a_mad) else 0.0)
+        + weights["feat_abs_med"] * (a_abs if np.isfinite(a_abs) else 0.0)
+        + weights["emb_area"] * (a_area if np.isfinite(a_area) else 0.0)
+        + weights["emb_med_r"] * (a_mr if np.isfinite(a_mr) else 0.0)
+    )
+    score_b = (
+        weights["feat_iqr"] * (b_iqr if np.isfinite(b_iqr) else 0.0)
+        + weights["feat_mad"] * (b_mad if np.isfinite(b_mad) else 0.0)
+        + weights["feat_abs_med"] * (b_abs if np.isfinite(b_abs) else 0.0)
+        + weights["emb_area"] * (b_area if np.isfinite(b_area) else 0.0)
+        + weights["emb_med_r"] * (b_mr if np.isfinite(b_mr) else 0.0)
+    )
+
+    winner_worse = driver_a_name if score_a > score_b else driver_b_name
+
+    return {
+        "label": label,
+        "scores": {driver_a_name: float(score_a), driver_b_name: float(score_b)},
+        "winner_worse": winner_worse,
+        "details": {
+            "feature_spread": feat_stats,
+            "embedding_spread": emb_stats,
+            "normalized_components": {
+                "mean_iqr": {driver_a_name: a_iqr, driver_b_name: b_iqr},
+                "mean_mad": {driver_a_name: a_mad, driver_b_name: b_mad},
+                "mean_abs_med": {driver_a_name: a_abs, driver_b_name: b_abs},
+                "emb_area": {driver_a_name: a_area, driver_b_name: b_area},
+                "emb_med_r": {driver_a_name: a_mr, driver_b_name: b_mr},
+            },
+            "weights": weights,
+        },
+    }
