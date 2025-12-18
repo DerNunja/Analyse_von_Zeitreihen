@@ -16,7 +16,8 @@ from utils import (
     prepare_label_data_for_plots,
     compute_embedding,
     compute_k_distance_curve,   
-    dbscan_eps_sweep,           
+    dbscan_eps_sweep,   
+    compute_driver_quality_scores,        
 )
 
 
@@ -182,7 +183,7 @@ for cl in cluster_labels_sorted:
 st.dataframe(pd.DataFrame(cluster_rows))
 
 # Tabs für Plots
-tab_ts, tab_pca, tab_dist = st.tabs(["📈 Zeitreihen", "🔀 Embedding & Cluster", "📊 Verteilungen"])
+tab_ts, tab_pca, tab_dist, tab_score = st.tabs(["📈 Zeitreihen", "🔀 Embedding & Cluster", "📊 Verteilungen", "🏁 Bewertung"])
 
 with tab_ts:
     st.markdown("#### Zeitreihen pro Manöver (Segment)")
@@ -476,3 +477,123 @@ with tab_dist:
         st.plotly_chart(fig_violin, use_container_width=True)
 
 st.success("Analyse abgeschlossen. Passe oben die Slider & Feature-Auswahl an, um Effekte zu sehen.")
+
+with tab_score:
+    st.markdown("## 🏁 Computergestützte Fahrerbewertung")
+
+    st.markdown(
+        """
+Die Bewertung basiert auf der Hypothese:
+
+- **Mehr Streuung / mehr Extremwerte** in wichtigen Fahrdynamik-Features (z. B. Jerk)  
+  → deutet auf **unsicherere bzw. weniger konstante** Fahrweise hin.
+
+Wir messen Streuung robust mit **IQR** und **MAD** sowie “Ruppigkeit” mit **median(|x|)**.
+Zusätzlich wird die **Streuung im 2D-Embedding** (PCA/t-SNE/UMAP) berücksichtigt.
+"""
+    )
+
+    # Welche Features sollen in den Score eingehen?
+    score_features = st.multiselect(
+        "Features für die Bewertung",
+        options=sorted(list(df_good.columns.intersection(df_bad.columns))),
+        default=[c for c in ["vel_jerk", "steer_jerk", "vel_acc", "steer_vel"] if c in df_good.columns and c in df_bad.columns],
+    )
+
+    if not score_features:
+        st.warning("Bitte mindestens ein Feature auswählen.")
+        st.stop()
+
+    # Gewichtung als Slider (optional)
+    with st.expander("Gewichte anpassen"):
+        w_feat_iqr = st.slider("Gewicht: Feature-IQR", 0.0, 2.0, 1.0, 0.1)
+        w_feat_mad = st.slider("Gewicht: Feature-MAD", 0.0, 2.0, 0.7, 0.1)
+        w_feat_abs = st.slider("Gewicht: median(|x|)", 0.0, 2.0, 0.7, 0.1)
+        w_emb_area = st.slider("Gewicht: Embedding-Fläche", 0.0, 2.0, 0.5, 0.1)
+        w_emb_medr = st.slider("Gewicht: Embedding median radius", 0.0, 2.0, 0.5, 0.1)
+
+    weights = {
+        "feat_iqr": w_feat_iqr,
+        "feat_mad": w_feat_mad,
+        "feat_abs_med": w_feat_abs,
+        "emb_area": w_emb_area,
+        "emb_med_r": w_emb_medr,
+    }
+
+    # Score für aktuelles Label
+    try:
+        res = compute_driver_quality_scores(
+            df1=df_good,
+            df2=df_bad,
+            label=label_to_plot,
+            label_column=label_column,
+            driver_a_name=driver_a_name,
+            driver_b_name=driver_b_name,
+            feature_cols=score_features,
+            dimred_method=dimred_method,
+            tsne_perplexity=tsne_perplexity,
+            umap_n_neighbors=umap_n_neighbors,
+            umap_min_dist=umap_min_dist,
+            weights=weights,
+        )
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
+
+    st.markdown(f"### Ergebnis für Label **{label_to_plot}**")
+    sA = res["scores"][driver_a_name]
+    sB = res["scores"][driver_b_name]
+    worse = res["winner_worse"]
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric(f"Score {driver_a_name}", f"{sA:.3f}")
+    c2.metric(f"Score {driver_b_name}", f"{sB:.3f}")
+    c3.metric("Schlechter (höherer Score)", worse)
+
+    with st.expander("Details (Feature- & Embedding-Streuung)"):
+        st.json(res["details"])
+
+    # Optional: Overall über alle Labels
+    st.markdown("---")
+    st.markdown("### Overall über alle Labels")
+
+    do_overall = st.checkbox("Overall-Score über alle gemeinsamen Labels berechnen", value=False)
+    if do_overall:
+        rows = []
+        for lbl in shared_labels:
+            try:
+                rr = compute_driver_quality_scores(
+                    df1=df_good,
+                    df2=df_bad,
+                    label=lbl,
+                    label_column=label_column,
+                    driver_a_name=driver_a_name,
+                    driver_b_name=driver_b_name,
+                    feature_cols=score_features,
+                    dimred_method=dimred_method,
+                    tsne_perplexity=tsne_perplexity,
+                    umap_n_neighbors=umap_n_neighbors,
+                    umap_min_dist=umap_min_dist,
+                    weights=weights,
+                )
+                rows.append({
+                    "label": lbl,
+                    f"score_{driver_a_name}": rr["scores"][driver_a_name],
+                    f"score_{driver_b_name}": rr["scores"][driver_b_name],
+                    "worse": rr["winner_worse"],
+                })
+            except Exception:
+                continue
+
+        df_scores = pd.DataFrame(rows)
+        st.dataframe(df_scores)
+
+        if not df_scores.empty:
+            mean_a = df_scores[f"score_{driver_a_name}"].mean()
+            mean_b = df_scores[f"score_{driver_b_name}"].mean()
+            worse_overall = driver_a_name if mean_a > mean_b else driver_b_name
+
+            st.markdown("#### Zusammenfassung")
+            st.write(f"Ø Score {driver_a_name}: **{mean_a:.3f}**")
+            st.write(f"Ø Score {driver_b_name}: **{mean_b:.3f}**")
+            st.write(f"➡️ Insgesamt schlechter: **{worse_overall}**")
